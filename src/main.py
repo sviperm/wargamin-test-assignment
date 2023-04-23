@@ -12,7 +12,7 @@ from apache_beam.io import ReadFromText
 from apache_beam.options.pipeline_options import PipelineOptions, SetupOptions
 from dotenv import load_dotenv
 
-from utils import get_conn_cursor, setup_loggers
+from utils import get_conn_cursor, setup_loggers, safe_float_convert
 
 load_dotenv()
 
@@ -20,7 +20,7 @@ basic_logger, skipped_logger = setup_loggers()
 
 
 class ProcessEvent(DoFn):
-    def process(self, element: str) -> Generator[tuple[str, ...] | None, None, None]:
+    def process(self, element: str) -> Generator[tuple[str | float, ...] | None, None, None]:
         """
         Process input element and yield event data if "battle_id" or "session_id" is found.
 
@@ -37,7 +37,9 @@ class ProcessEvent(DoFn):
             skipped_logger.warning(f"Skipped element: {element}")
             yield None
 
-        if "battle_id" in event_dict:
+        event_name = event_dict['event_name']
+
+        if event_name == 'multiplayer_battle_ended':
             yield (
                 "battle",
                 event_dict["battle_id"],
@@ -57,7 +59,7 @@ class ProcessEvent(DoFn):
                 event_dict["outcome"],
                 event_dict["ship_destroyed"],
             )
-        elif "session_id" in event_dict:
+        elif event_name == 'session_started':
             yield (
                 "session",
                 event_dict["session_id"],
@@ -76,6 +78,30 @@ class ProcessEvent(DoFn):
                 event_dict["platform"],
                 event_dict["user_is_spender"],
             )
+        elif event_name == 'in_app_purchase_log_server':
+            yield (
+                "in_app_purchase",
+                event_dict["user_id"],
+                event_dict["user_ip"],
+                event_dict["user_server_region"],
+                event_dict["server_version"],
+                event_dict["player_name"],
+                event_dict["event_name"],
+                event_dict["event_timestamp"],
+                event_dict["user_device_country"],
+                event_dict["user_type"],
+                event_dict["client_version"],
+                event_dict["is_premium"],
+                event_dict["platform"],
+                event_dict["product_name"],
+                safe_float_convert(event_dict["real_currency_amount"]),
+                event_dict["real_currency_type"],
+                safe_float_convert(event_dict["usd_cost"]),
+                event_dict["user_is_spender"],
+            )
+        else:
+            skipped_logger.warning(f"Skipped element: {element}")
+            yield None
 
 
 class EnrichEvent(DoFn):
@@ -98,15 +124,15 @@ class EnrichEvent(DoFn):
                 longitude = response.location.longitude
                 return country, city, latitude, longitude
         except Exception as e:
-            skipped_logger.warning(f"Failed to get country for IP {user_ip}: {e}")
+            # basic_logger.warning(f"Failed to get country for IP {user_ip}: {e}")
             return None, None, None, None
 
-    def process(self, element: tuple[str, ...] | None) -> Generator[tuple[str | float | None, ...] | None, None, None]:
+    def process(self, element: tuple[str | float, ...] | None) -> Generator[tuple[str | float | None, ...] | None, None, None]:
         if not element:
             return None
 
         user_ip = element[2]
-        geo_data = self.get_user_country(user_ip)
+        geo_data = self.get_user_country(user_ip)  # type: ignore
         new_element = element + geo_data
         yield new_element
 
@@ -130,10 +156,12 @@ class WriteToPostgreSQL(DoFn):
 
         self.battle_buffer: list[tuple[str | float | None, ...]]
         self.session_buffer: list[tuple[str | float | None, ...]]
+        self.in_app_purchase_buffer: list[tuple[str | float | None, ...]]
 
     def start_bundle(self):
         self.battle_buffer = []
         self.session_buffer = []
+        self.in_app_purchase_buffer = []
 
     def process(self, element: tuple[str | float | None, ...] | None):
         """
@@ -159,15 +187,27 @@ class WriteToPostgreSQL(DoFn):
                 self.create_sessions_table()
                 self.insert_sessions_to_db()
 
+        elif event_type == "in_app_purchase":
+            self.in_app_purchase_buffer.append(element[1:])
+            if len(self.session_buffer) >= self.batch_size:
+                self.create_in_app_purchase_table()
+                self.insert_in_app_purchase_to_db()
+
     def finish_bundle(self):
         """
         Finish bundle by inserting remaining events in the buffer into the database.
         """
         if self.battle_buffer:
+            self.create_battles_table()
             self.insert_battles_to_db()
 
         if self.session_buffer:
+            self.create_sessions_table()
             self.insert_sessions_to_db()
+
+        if self.in_app_purchase_buffer:
+            self.create_in_app_purchase_table()
+            self.insert_in_app_purchase_to_db()
 
     def create_battles_table(self):
         """
@@ -177,7 +217,8 @@ class WriteToPostgreSQL(DoFn):
 
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS battle_events (
-                battle_id TEXT PRIMARY KEY,
+                id SERIAL PRIMARY KEY,
+                battle_id TEXT NOT NULL,
                 user_ip TEXT,
                 user_server_region TEXT,
                 server_version TEXT,
@@ -185,7 +226,7 @@ class WriteToPostgreSQL(DoFn):
                 event_name TEXT,
                 event_timestamp TIMESTAMP,
                 user_device_country TEXT,
-                user_id TEXT,
+                user_id TEXT NOT NULL,
                 user_type TEXT,
                 client_version TEXT,
                 is_premium BOOLEAN,
@@ -211,7 +252,8 @@ class WriteToPostgreSQL(DoFn):
 
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS session_events (
-                session_id TEXT PRIMARY KEY,
+                id SERIAL PRIMARY KEY,
+                session_id TEXT NOT NULL,
                 user_ip TEXT,
                 user_server_region TEXT,
                 server_version TEXT,
@@ -220,12 +262,48 @@ class WriteToPostgreSQL(DoFn):
                 event_name TEXT,
                 event_timestamp TIMESTAMP,
                 user_device_country TEXT,
-                user_id TEXT,
+                user_id TEXT NOT NULL,
                 user_type TEXT,
                 client_version TEXT,
                 is_premium BOOLEAN,
                 platform TEXT,
                 user_is_spender BOOLEAN,
+                country TEXT, 
+                city TEXT, 
+                latitude FLOAT, 
+                longitude FLOAT
+            )
+        ''')
+
+        conn.commit()
+        conn.close()
+
+    def create_in_app_purchase_table(self):
+        """
+        Create 'in_app_purchase_events' table in the database if it doesn't exist.
+        """
+        conn, cursor = get_conn_cursor(self.db_config)
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS in_app_purchase_events (
+                id SERIAL PRIMARY KEY,
+                user_ip TEXT,
+                user_server_region TEXT,
+                server_version TEXT,
+                player_name TEXT,
+                event_name TEXT,
+                event_timestamp TIMESTAMP,
+                user_device_country TEXT,
+                user_id TEXT,
+                user_type TEXT,
+                client_version TEXT,
+                is_premium BOOL,
+                platform TEXT,
+                product_name TEXT,
+                real_currency_amount FLOAT,
+                real_currency_type TEXT,
+                usd_cost FLOAT,
+                user_is_spender BOOL,
                 country TEXT, 
                 city TEXT, 
                 latitude FLOAT, 
@@ -243,27 +321,29 @@ class WriteToPostgreSQL(DoFn):
         conn, cursor = get_conn_cursor(self.db_config)
 
         psycopg2.extras.execute_batch(cursor, '''
-            INSERT INTO battle_events VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (battle_id) DO UPDATE SET
-            user_ip = excluded.user_ip,
-            user_server_region = excluded.user_server_region,
-            server_version = excluded.server_version,
-            player_name = excluded.player_name,
-            event_name = excluded.event_name,
-            event_timestamp = excluded.event_timestamp,
-            user_device_country = excluded.user_device_country,
-            user_id = excluded.user_id,
-            user_type = excluded.user_type,
-            client_version = excluded.client_version,
-            is_premium = excluded.is_premium,
-            platform = excluded.platform,
-            user_is_spender = excluded.user_is_spender,
-            outcome = excluded.outcome,
-            ship_destroyed = excluded.ship_destroyed,
-            country = excluded.country, 
-            city = excluded.city, 
-            latitude = excluded.latitude, 
-            longitude = excluded.longitude 
+            INSERT INTO battle_events (
+                battle_id,
+                user_ip,
+                user_server_region,
+                server_version,
+                player_name,
+                event_name,
+                event_timestamp,
+                user_device_country,
+                user_id,
+                user_type,
+                client_version,
+                is_premium,
+                platform,
+                user_is_spender,
+                outcome,
+                ship_destroyed,
+                country,
+                city,
+                latitude,
+                longitude
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ''', self.battle_buffer)
 
         conn.commit()
@@ -273,32 +353,72 @@ class WriteToPostgreSQL(DoFn):
 
     def insert_sessions_to_db(self):
         """
-        Insert buffered battle events into the 'battle_events' table in the database.
+        Insert buffered session events into the 'session_events' table in the database.
         """
         conn, cursor = get_conn_cursor(self.db_config)
 
         psycopg2.extras.execute_batch(cursor, '''
-            INSERT INTO session_events VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (session_id) DO UPDATE SET
-            user_ip = excluded.user_ip,
-            user_server_region = excluded.user_server_region,
-            server_version = excluded.server_version,
-            player_name = excluded.player_name,
-            login_attempt_id = excluded.login_attempt_id,
-            event_name = excluded.event_name,
-            event_timestamp = excluded.event_timestamp,
-            user_device_country = excluded.user_device_country,
-            user_id = excluded.user_id,
-            user_type = excluded.user_type,
-            client_version = excluded.client_version,
-            is_premium = excluded.is_premium,
-            platform = excluded.platform,
-            user_is_spender = excluded.user_is_spender,
-            country = excluded.country, 
-            city = excluded.city, 
-            latitude = excluded.latitude, 
-            longitude = excluded.longitude 
+            INSERT INTO session_events (
+                session_id,
+                user_ip,
+                user_server_region,
+                server_version,
+                player_name,
+                login_attempt_id,
+                event_name,
+                event_timestamp,
+                user_device_country,
+                user_id,
+                user_type,
+                client_version,
+                is_premium,
+                platform,
+                user_is_spender,
+                country,
+                city,
+                latitude,
+                longitude
+            )
+            VALUES (%s,%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ''', self.session_buffer)
+
+        conn.commit()
+        conn.close()
+
+        self.session_buffer.clear()
+
+    def insert_in_app_purchase_to_db(self):
+        """
+        Insert buffered session events into the 'in_app_purchase_events' table in the database.
+        """
+        conn, cursor = get_conn_cursor(self.db_config)
+
+        psycopg2.extras.execute_batch(cursor, '''
+            INSERT INTO in_app_purchase_events (
+                user_id,
+                user_ip,
+                user_server_region,
+                server_version,
+                player_name,
+                event_name,
+                event_timestamp,
+                user_device_country,
+                user_type,
+                client_version,
+                is_premium,
+                platform,
+                product_name,
+                real_currency_amount,
+                real_currency_type,
+                usd_cost,
+                user_is_spender,
+                country,
+                city,
+                latitude,
+                longitude
+            )
+            VALUES (%s,%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ''', self.in_app_purchase_buffer)
 
         conn.commit()
         conn.close()

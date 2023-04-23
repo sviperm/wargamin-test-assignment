@@ -46,3 +46,9 @@ def setup_loggers() -> tuple[logging.Logger, logging.Logger]:
     skipped_logger.addHandler(skipped_handler)
 
     return basic_logger, skipped_logger
+
+
+def safe_float_convert(n: str | float) -> float:
+    if isinstance(n, float):
+        return n
+    return float(n.replace(',', '.'))
