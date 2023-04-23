@@ -57,7 +57,7 @@ class ProcessEvent(DoFn):
                 event_dict["outcome"],
                 event_dict["ship_destroyed"],
             )
-        elif "session_id" in event:
+        elif "session_id" in event_dict:
             yield (
                 "session",
                 event_dict["session_id"],
@@ -278,7 +278,7 @@ class WriteToPostgreSQL(DoFn):
         conn, cursor = get_conn_cursor(self.db_config)
 
         psycopg2.extras.execute_batch(cursor, '''
-            INSERT INTO session_events VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO session_events VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (session_id) DO UPDATE SET
             user_ip = excluded.user_ip,
             user_server_region = excluded.user_server_region,
