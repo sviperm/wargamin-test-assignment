@@ -2,8 +2,9 @@ import argparse
 import json
 import os
 import re
-
 from typing import Generator
+
+import geoip2.database
 import psycopg2
 import psycopg2.extras
 from apache_beam import DoFn, ParDo, Pipeline
@@ -77,6 +78,39 @@ class ProcessEvent(DoFn):
             )
 
 
+class EnrichEvent(DoFn):
+    def get_user_country(self, user_ip: str) -> tuple[str | None, str | None, float | None, float | None]:
+        """
+        Get the country name from the user's IP address.
+
+        Args:
+            user_ip: The user's IP address.
+
+        Returns:
+            The country name.
+        """
+        try:
+            with geoip2.database.Reader('config/GeoLite2-City_20230421/GeoLite2-City.mmdb') as reader:
+                response = reader.city(user_ip)
+                country = response.country.name
+                city = response.city.name
+                latitude = response.location.latitude
+                longitude = response.location.longitude
+                return country, city, latitude, longitude
+        except Exception as e:
+            skipped_logger.warning(f"Failed to get country for IP {user_ip}: {e}")
+            return None, None, None, None
+
+    def process(self, element: tuple[str, ...] | None) -> Generator[tuple[str | float | None, ...] | None, None, None]:
+        if not element:
+            return None
+
+        user_ip = element[2]
+        geo_data = self.get_user_country(user_ip)
+        new_element = element + geo_data
+        yield new_element
+
+
 class WriteToPostgreSQL(DoFn):
     def __init__(self, batch_size: int = 1000):
         """
@@ -94,14 +128,14 @@ class WriteToPostgreSQL(DoFn):
         }
         self.batch_size = batch_size
 
-        self.battle_buffer: list[tuple[str, ...]]
-        self.session_buffer: list[tuple[str, ...]]
+        self.battle_buffer: list[tuple[str | float | None, ...]]
+        self.session_buffer: list[tuple[str | float | None, ...]]
 
     def start_bundle(self):
         self.battle_buffer = []
         self.session_buffer = []
 
-    def process(self, element: tuple[str, ...] | None):
+    def process(self, element: tuple[str | float | None, ...] | None):
         """
         Process event data and store it in PostgreSQL.
 
@@ -158,7 +192,11 @@ class WriteToPostgreSQL(DoFn):
                 platform TEXT,
                 user_is_spender BOOLEAN,
                 outcome TEXT,
-                ship_destroyed INTEGER
+                ship_destroyed INTEGER,
+                country TEXT, 
+                city TEXT, 
+                latitude FLOAT, 
+                longitude FLOAT
             )
         ''')
 
@@ -187,7 +225,11 @@ class WriteToPostgreSQL(DoFn):
                 client_version TEXT,
                 is_premium BOOLEAN,
                 platform TEXT,
-                user_is_spender BOOLEAN
+                user_is_spender BOOLEAN,
+                country TEXT, 
+                city TEXT, 
+                latitude FLOAT, 
+                longitude FLOAT
             )
         ''')
 
@@ -201,7 +243,7 @@ class WriteToPostgreSQL(DoFn):
         conn, cursor = get_conn_cursor(self.db_config)
 
         psycopg2.extras.execute_batch(cursor, '''
-            INSERT INTO battle_events VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO battle_events VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (battle_id) DO UPDATE SET
             user_ip = excluded.user_ip,
             user_server_region = excluded.user_server_region,
@@ -217,7 +259,11 @@ class WriteToPostgreSQL(DoFn):
             platform = excluded.platform,
             user_is_spender = excluded.user_is_spender,
             outcome = excluded.outcome,
-            ship_destroyed = excluded.ship_destroyed
+            ship_destroyed = excluded.ship_destroyed,
+            country = excluded.country, 
+            city = excluded.city, 
+            latitude = excluded.latitude, 
+            longitude = excluded.longitude 
         ''', self.battle_buffer)
 
         conn.commit()
@@ -247,7 +293,11 @@ class WriteToPostgreSQL(DoFn):
             client_version = excluded.client_version,
             is_premium = excluded.is_premium,
             platform = excluded.platform,
-            user_is_spender = excluded.user_is_spender
+            user_is_spender = excluded.user_is_spender,
+            country = excluded.country, 
+            city = excluded.city, 
+            latitude = excluded.latitude, 
+            longitude = excluded.longitude 
         ''', self.session_buffer)
 
         conn.commit()
@@ -256,7 +306,19 @@ class WriteToPostgreSQL(DoFn):
         self.session_buffer.clear()
 
 
-def run(argv=None, save_main_session=True):
+def run(argv: list[str] | None = None, save_main_session: bool = True) -> None:
+    """
+    Execute the ETL pipeline to process, enrich, and store event data in PostgreSQL.
+
+    Args:
+        argv: A list of command-line arguments, including input file path and batch size.
+        save_main_session: A boolean value to determine whether to save the main session.
+                           If True, the main session is saved, enabling pickling of global
+                           variables.
+
+    Returns:
+        None
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--input',
@@ -279,6 +341,7 @@ def run(argv=None, save_main_session=True):
             p
             | 'ReadFromGCS' >> ReadFromText(known_args.input)
             | 'ProcessEvent' >> ParDo(ProcessEvent())
+            | 'EnrichEvent' >> ParDo(EnrichEvent())
             | 'Write to PostgreSQL' >> ParDo(WriteToPostgreSQL(batch_size=known_args.batch_size))
         )
 
